@@ -1,35 +1,29 @@
 """
 =========================================================================
- CHATBOT GYM & NUTRISI (RAG SEDERHANA)
+ CHATBOT GYM & NUTRISI — RAG + FastAPI / Ollama / Anthropic
 =========================================================================
-File ini adalah contoh chatbot yang memakai dataset di gym_dataset.py
-sebagai sumber referensi (knowledge base), lalu mengirim pertanyaan
-user + referensi tersebut ke LLM (Claude) untuk dijawab secara natural.
-
-Konsep RAG (Retrieval-Augmented Generation) di sini sangat sederhana:
-1. RETRIEVE : cari data relevan dari dataset (FAQ_DATA, FOODS, PROGRAMS)
-   berdasarkan pertanyaan user
-2. AUGMENT  : gabungkan data relevan itu ke dalam prompt
-3. GENERATE : kirim ke LLM, LLM jawab berdasarkan data yang diberikan
-
 CARA PAKAI:
-1. Pastikan sudah install package "anthropic":
-       pip install anthropic
-2. Set API key Anthropic sebagai environment variable:
-       export ANTHROPIC_API_KEY="sk-ant-xxxxxxxx"     (Mac/Linux)
-       setx ANTHROPIC_API_KEY "sk-ant-xxxxxxxx"        (Windows, lalu buka terminal baru)
-3. Jalankan:
-       python3 chatbot.py
-4. Ketik pertanyaan, contoh: "apa itu bulking?" atau "menu untuk cutting apa saja?"
-   Ketik "exit" untuk keluar.
+  Mode demo (tanpa API, langsung bisa dicoba):
+      python3 chatbot.py
 
-CATATAN: Kalau belum punya API key / belum mau pakai API dulu, jalankan
-mode "tanpa API" di bagian bawah file ini (lihat fungsi demo_tanpa_api())
-yang hanya menampilkan hasil retrieval mentah tanpa LLM.
+  Mode Ollama (gratis, LLM lokal — install Ollama dulu):
+      set CHAT_MODE=ollama          (Windows PowerShell)
+      python3 chatbot.py
+
+  Mode FastAPI (server kamu sendiri — jalankan api_server.py dulu):
+      set CHAT_MODE=fastapi         (Windows PowerShell)
+      python3 chatbot.py
+
+  Mode Anthropic (butuh API key):
+      set ANTHROPIC_API_KEY=sk-ant-xxx
+      python3 chatbot.py
 =========================================================================
 """
 
 import os
+import sys
+import requests as req
+
 from gym_dataset import (
     cari_faq,
     cari_makanan_relevan,
@@ -37,136 +31,223 @@ from gym_dataset import (
     generate_weekly_schedule,
 )
 
+# =========================================================================
+# KONFIGURASI — ubah di sini kalau mau ganti mode
+# =========================================================================
+CHAT_MODE      = os.environ.get("CHAT_MODE", "anthropic")  # anthropic | ollama | fastapi
+OLLAMA_URL     = "http://localhost:11434/api/chat"
+OLLAMA_MODEL   = "llama3.2"
+FASTAPI_URL    = "http://localhost:8000/chat"
+
+
+# =========================================================================
+# SYSTEM PROMPT — di sinilah "kepribadian" chatbot diatur
+# =========================================================================
+# BAGIAN INI YANG BISA KAMU UBAH untuk variasi bahasa yang lebih hidup.
+# Claude/LLM akan generate jawaban sesuai instruksi di sini secara otomatis.
+
+SYSTEM_PROMPT = """
+Kamu adalah asisten gym & nutrisi bernama "GymBot" yang ramah, santai, dan
+bicara seperti teman gym yang sudah berpengalaman.
+
+Gaya bicara:
+- Variatif dan natural — jangan selalu mulai dengan pola yang sama
+- Kadang santai ("nah bro", "oke jadi gini", "gue saranin"), kadang lebih serius
+  tergantung pertanyaannya
+- Boleh pakai analogi sederhana biar mudah dipahami
+- Kalau ada pilihan program, bantu user mikir mana yang cocok buat kondisi mereka
+- Singkat dan to the point — tidak perlu bertele-tele
+
+Aturan:
+- Jawab HANYA berdasarkan data referensi yang diberikan
+- Kalau data tidak cukup, jujur bilang "belum ada di database saya"
+- Jangan pernah jawab di luar topik gym, nutrisi, dan kesehatan olahraga
+"""
+
+
+# =========================================================================
+# FUNGSI RETRIEVAL (RETRIEVE)
+# =========================================================================
 
 def bangun_konteks(query: str) -> str:
-    """
-    Tahap RETRIEVE + AUGMENT.
-    Mengumpulkan semua data relevan dari dataset berdasarkan pertanyaan
-    user, lalu menyusunnya jadi teks konteks yang akan dikirim ke LLM.
-    """
-    bagian_konteks = []
+    """Kumpulkan data relevan dari dataset berdasarkan pertanyaan user."""
+    bagian = []
 
-    # 1. Cari di FAQ
-    faq_hasil = cari_faq(query, top_n=3)
-    if faq_hasil:
-        bagian_konteks.append("Referensi FAQ:\n" + "\n".join(f"- {f}" for f in faq_hasil))
+    faq = cari_faq(query, top_n=3)
+    if faq:
+        bagian.append("Referensi FAQ:\n" + "\n".join(f"- {f}" for f in faq))
 
-    # 2. Cari makanan yang disebut di pertanyaan
-    makanan_hasil = cari_makanan_relevan(query, top_n=5)
-    if makanan_hasil:
-        baris_makanan = [
+    makanan = cari_makanan_relevan(query, top_n=5)
+    if makanan:
+        baris = [
             f"- {nama}: {d['protein']}g protein, {d['karbo']}g karbo, "
             f"{d['lemak']}g lemak, {d['kalori']} kkal per {d['unit']}"
-            for nama, d in makanan_hasil
+            for nama, d in makanan
         ]
-        bagian_konteks.append("Data gizi makanan terkait:\n" + "\n".join(baris_makanan))
+        bagian.append("Data gizi makanan:\n" + "\n".join(baris))
 
-    # 3. Cari nama program yang disebut (bulking, cutting, dll)
-    for nama_program, data_program in PROGRAMS.items():
-        if nama_program.replace("_", " ") in query.lower() or nama_program in query.lower():
-            bagian_konteks.append(
-                f"Detail program '{nama_program}': {data_program['deskripsi']}. "
-                f"Target protein {data_program['protein_per_kg']} g/kg berat badan, "
-                f"split latihan: {', '.join(g or 'rest' for g in data_program['split_latihan'])}."
+    for nama_prog, data_prog in PROGRAMS.items():
+        if nama_prog.replace("_", " ") in query.lower() or nama_prog in query.lower():
+            bagian.append(
+                f"Detail program '{nama_prog}': {data_prog['deskripsi']}. "
+                f"Protein target: {data_prog['protein_per_kg']} g/kg. "
+                f"Split latihan: {', '.join(g or 'rest' for g in data_prog['split_latihan'])}."
             )
 
-    if not bagian_konteks:
-        return "Tidak ada data spesifik yang cocok di dataset untuk pertanyaan ini."
-
-    return "\n\n".join(bagian_konteks)
+    return "\n\n".join(bagian) if bagian else "Tidak ada data spesifik di dataset untuk pertanyaan ini."
 
 
-def tanya_llm_dengan_konteks(query: str, konteks: str) -> str:
-    """
-    Tahap GENERATE.
-    Mengirim pertanyaan + konteks ke Claude API, lalu mengembalikan jawaban.
-    Membutuhkan package 'anthropic' dan ANTHROPIC_API_KEY.
-    """
+# =========================================================================
+# FUNGSI GENERATE — 3 MODE
+# =========================================================================
+
+def _via_anthropic(query: str, konteks: str) -> str:
+    """Mode Anthropic API (butuh API key)."""
     try:
         import anthropic
     except ImportError:
-        return (
-            "Package 'anthropic' belum terinstall. Jalankan dulu:\n"
-            "    pip install anthropic\n"
-            "Atau coba mode tanpa API dengan menjalankan demo_tanpa_api()."
-        )
+        return "Package 'anthropic' belum terinstall. Jalankan: pip install anthropic"
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        return (
-            "ANTHROPIC_API_KEY belum di-set. Set dulu environment variable-nya, "
-            "atau coba mode tanpa API dengan demo_tanpa_api()."
-        )
+        return "ANTHROPIC_API_KEY belum di-set. Coba mode lain: set CHAT_MODE=ollama"
 
     client = anthropic.Anthropic(api_key=api_key)
-
-    system_prompt = (
-        "Kamu adalah asisten gym & nutrisi yang ramah dan membantu. "
-        "Jawab pertanyaan user HANYA berdasarkan data referensi yang diberikan. "
-        "Jika data referensi tidak cukup untuk menjawab, katakan dengan jujur "
-        "bahwa informasinya belum ada di dataset. Jawab dalam Bahasa Indonesia "
-        "dengan singkat dan jelas."
-    )
-
-    user_message = f"Data referensi:\n{konteks}\n\nPertanyaan user: {query}"
-
+    pesan = f"Data referensi:\n{konteks}\n\nPertanyaan: {query}"
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=500,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_message}],
+        max_tokens=600,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": pesan}],
     )
-
     return response.content[0].text
 
 
-def demo_tanpa_api():
-    """
-    Mode demo TANPA perlu API key — hanya menampilkan hasil retrieval
-    mentah dari dataset. Berguna untuk memastikan logic pencarian data
-    sudah jalan benar sebelum sambung ke LLM.
-    """
-    print("=" * 70)
-    print("MODE DEMO TANPA API (hanya menampilkan hasil retrieval dataset)")
-    print("Ketik 'exit' untuk keluar")
-    print("=" * 70)
+def _via_ollama(query: str, konteks: str) -> str:
+    """Mode Ollama — LLM gratis yang jalan di komputer sendiri."""
+    pesan = f"Data referensi:\n{konteks}\n\nPertanyaan: {query}"
+    try:
+        response = req.post(OLLAMA_URL, json={
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system",  "content": SYSTEM_PROMPT},
+                {"role": "user",    "content": pesan},
+            ],
+            "stream": False,
+        }, timeout=60)
+        return response.json()["message"]["content"]
+    except req.exceptions.ConnectionError:
+        return "Ollama tidak bisa dihubungi. Pastikan Ollama sudah jalan (ketik: ollama serve)"
 
+
+def _via_fastapi(query: str, konteks: str) -> str:
+    """Mode FastAPI — kirim ke api_server.py yang kamu jalankan sendiri."""
+    try:
+        response = req.post(FASTAPI_URL, json={"pertanyaan": query}, timeout=60)
+        return response.json()["jawaban"]
+    except req.exceptions.ConnectionError:
+        return (
+            "API server tidak bisa dihubungi di localhost:8000. "
+            "Pastikan api_server.py sudah jalan di terminal lain: uvicorn api_server:app --reload"
+        )
+
+
+def jawab(query: str) -> str:
+    """
+    Fungsi utama chatbot.
+    RETRIEVE → AUGMENT → GENERATE
+    """
+    konteks = bangun_konteks(query)
+
+    if CHAT_MODE == "ollama":
+        return _via_ollama(query, konteks)
+    elif CHAT_MODE == "fastapi":
+        return _via_fastapi(query, konteks)
+    else:
+        return _via_anthropic(query, konteks)
+
+
+# =========================================================================
+# MODE DEMO (tanpa LLM) — cukup tampilkan hasil retrieval
+# =========================================================================
+
+def demo_tanpa_api():
+    print("=" * 65)
+    print("MODE DEMO — menampilkan data yang ditemukan di dataset")
+    print("Ketik 'exit' untuk keluar")
+    print("=" * 65)
     while True:
         query = input("\nPertanyaan kamu: ").strip()
-        if query.lower() == "exit":
+        if query.lower() in ("exit", "quit", "q"):
             break
         if not query:
             continue
-
         konteks = bangun_konteks(query)
-        print("\n--- Data relevan yang ditemukan di dataset ---")
+        print("\n--- Data relevan dari dataset ---")
         print(konteks)
 
 
+# =========================================================================
+# CHAT LOOP UTAMA
+# =========================================================================
+
 def chat_loop():
-    """Loop chatbot interaktif lewat terminal, memakai LLM (butuh API key)."""
-    print("=" * 70)
-    print("CHATBOT GYM & NUTRISI")
+    mode_label = {
+        "anthropic": "Anthropic API (Claude)",
+        "ollama":    f"Ollama lokal ({OLLAMA_MODEL})",
+        "fastapi":   "FastAPI server lokal",
+    }.get(CHAT_MODE, CHAT_MODE)
+
+    print("=" * 65)
+    print(f"GYMBOT — Mode: {mode_label}")
+    print("Ketik 'jadwal <program> <berat>' untuk generate jadwal")
+    print("Contoh: jadwal bulking_contest_prep 70")
     print("Ketik 'exit' untuk keluar")
-    print("=" * 70)
+    print("=" * 65)
 
     while True:
-        query = input("\nKamu: ").strip()
-        if query.lower() == "exit":
+        try:
+            query = input("\nKamu: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nSampai jumpa!")
+            break
+
+        if query.lower() in ("exit", "quit", "q"):
             print("Sampai jumpa!")
             break
         if not query:
             continue
 
-        konteks = bangun_konteks(query)
-        jawaban = tanya_llm_dengan_konteks(query, konteks)
-        print(f"\nBot: {jawaban}")
+        # Shortcut: generate jadwal otomatis
+        if query.lower().startswith("jadwal "):
+            parts = query.split()
+            if len(parts) == 3:
+                try:
+                    hasil = generate_weekly_schedule(
+                        program=parts[1],
+                        berat_badan_kg=float(parts[2])
+                    )
+                    from gym_dataset import print_jadwal
+                    print_jadwal(hasil)
+                    continue
+                except (ValueError, KeyError) as e:
+                    print(f"GymBot: {e}")
+                    continue
 
+        jawaban = jawab(query)
+        print(f"\nGymBot: {jawaban}")
+
+
+# =========================================================================
+# ENTRY POINT
+# =========================================================================
 
 if __name__ == "__main__":
-    # Cek otomatis: kalau API key belum di-set, jalankan mode demo dulu
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("ANTHROPIC_API_KEY belum di-set, menjalankan mode demo tanpa API...\n")
+    api_key_ada   = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    mode_eksplisit = "CHAT_MODE" in os.environ
+
+    if not api_key_ada and not mode_eksplisit:
+        print("Info: API key & CHAT_MODE tidak di-set, menjalankan mode demo...\n")
         demo_tanpa_api()
     else:
         chat_loop()
